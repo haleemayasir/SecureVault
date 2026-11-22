@@ -1,0 +1,4 @@
+student_id,course,grade
+SYN-001,Information Security,A
+SYN-002,Information Security,B
+SYN-003,Information Security,A

@@ -1,0 +1,4 @@
+SYNTHETIC STUDENT RECORDS
+SYN-001 | Course: Information Security | Status: Active
+SYN-002 | Course: Information Security | Status: Active
+SYN-003 | Course: Information Security | Status: Active

@@ -1,0 +1,4 @@
+student_id,session,status
+SYN-001,IS-01,present
+SYN-002,IS-01,present
+SYN-003,IS-01,absent

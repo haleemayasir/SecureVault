@@ -1,0 +1,4 @@
+assignment_id,student_id,status
+A-01,SYN-001,submitted
+A-01,SYN-002,submitted
+A-01,SYN-003,pending
