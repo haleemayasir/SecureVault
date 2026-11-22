@@ -18,6 +18,8 @@ from typing import Iterable
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from custodian_keys import encrypt_share_for_custodian
+
 
 CHUNK_SIZE = 1024 * 1024
 MAGIC = b"G6B45V1"
@@ -107,20 +109,6 @@ def atomic_write(path: Path, content: bytes, mode: int = 0o600) -> None:
         raise
 
 
-def write_share(path: Path, share: bytes) -> None:
-    atomic_write(path, share, 0o600)
-
-
-def read_share(path: Path) -> bytes:
-    try:
-        share = path.read_bytes()
-    except FileNotFoundError as exc:
-        raise BackupError(f"Custodian share not found: {path}") from exc
-    if len(share) != 33 or share[0] != 0xA5:
-        raise BackupError(f"Invalid custodian share: {path}")
-    return share
-
-
 def split_key(key: bytes) -> tuple[bytes, bytes]:
     if len(key) != 32:
         raise ValueError("AES-256 key must be 32 bytes")
@@ -133,7 +121,18 @@ def join_key(share_a: bytes, share_b: bytes) -> bytes:
     return bytes(a ^ b for a, b in zip(share_a[1:], share_b[1:]))
 
 
-def create_backup(source: Path, archive: Path, share_a_path: Path, share_b_path: Path) -> dict[str, object]:
+def create_backup_material(
+    source: Path,
+    archive: Path,
+    custodian_a: tuple[str, bytes],
+    custodian_b: tuple[str, bytes],
+) -> dict[str, object]:
+    source_root = source.resolve()
+    archive = archive.resolve()
+    if source_root in archive.parents:
+        raise BackupError("Save the encrypted archive outside the source folder")
+    if archive.exists():
+        raise BackupError("The archive file already exists; choose a new location")
     manifest = collect_files(source)
     payload, metadata = build_payload(source, manifest)
     data_key = AESGCM.generate_key(bit_length=256)
@@ -149,17 +148,42 @@ def create_backup(source: Path, archive: Path, share_a_path: Path, share_b_path:
     verification = AESGCM(data_key).encrypt(test_nonce, b"verification", None)
     AESGCM(data_key).decrypt(test_nonce, verification, None)
 
+    archive_digest = sha256_file(archive)
     share_a, share_b = split_key(data_key)
-    write_share(share_a_path, share_a)
-    write_share(share_b_path, share_b)
-
+    envelope_a = encrypt_share_for_custodian(
+        share_a,
+        custodian_a[0],
+        "A",
+        archive_digest,
+        custodian_a[1],
+    )
+    envelope_b = encrypt_share_for_custodian(
+        share_b,
+        custodian_b[0],
+        "B",
+        archive_digest,
+        custodian_b[1],
+    )
     return {
         "archive": str(archive),
         "file_count": len(manifest),
-        "archive_sha256": sha256_file(archive),
-        "custodian_a_share": str(share_a_path),
-        "custodian_b_share": str(share_b_path),
+        "archive_sha256": archive_digest,
+        "custodian_a_envelope": envelope_a,
+        "custodian_b_envelope": envelope_b,
+        "files": manifest,
     }
+
+
+def create_backup(
+    source: Path,
+    archive: Path,
+    share_a_path: Path,
+    share_b_path: Path,
+) -> dict[str, object]:
+    del source, archive, share_a_path, share_b_path
+    raise BackupError(
+        "Plaintext share-file export is disabled. Create backups in the SecureVault app."
+    )
 
 
 def read_archive(archive: Path) -> tuple[bytes, bytes, dict[str, object]]:
@@ -179,10 +203,14 @@ def read_archive(archive: Path) -> tuple[bytes, bytes, dict[str, object]]:
     return nonce, ciphertext, {}
 
 
-def decrypt_archive(archive: Path, share_a_path: Path, share_b_path: Path) -> dict[str, object]:
+def decrypt_archive(archive: Path, share_a: bytes, share_b: bytes) -> dict[str, object]:
     nonce, ciphertext, _ = read_archive(archive)
-    share_a = read_share(share_a_path)
-    share_b = read_share(share_b_path)
+    if not isinstance(share_a, bytes) or not isinstance(share_b, bytes):
+        raise BackupError(
+            "Recovery requires in-memory shares released by both custodians; share-file restore is disabled."
+        )
+    if any(len(share) != 33 or share[0] != 0xA5 for share in (share_a, share_b)):
+        raise BackupError("Invalid in-memory custodian recovery material.")
     data_key = join_key(share_a, share_b)
     try:
         plaintext = AESGCM(data_key).decrypt(nonce, ciphertext, AAD)
@@ -205,15 +233,21 @@ def validate_payload(payload: dict[str, object]) -> list[dict[str, object]]:
     return manifest
 
 
-def restore_backup(archive: Path, destination: Path, share_a_path: Path, share_b_path: Path) -> dict[str, object]:
+def restore_backup(
+    archive: Path,
+    destination: Path,
+    share_a: bytes,
+    share_b: bytes,
+) -> dict[str, object]:
     if destination.exists() and any(destination.iterdir()):
         raise BackupError("Restore destination must be empty")
     destination.mkdir(parents=True, exist_ok=True)
 
-    payload = decrypt_archive(archive, share_a_path, share_b_path)
+    payload = decrypt_archive(archive, share_a, share_b)
     manifest = validate_payload(payload)
     files = payload["files"]
     restored = 0
+    verified_files: list[dict[str, object]] = []
     temp_destination = Path(tempfile.mkdtemp(prefix=".pbl045-", dir=str(destination.parent)))
 
     try:
@@ -231,6 +265,14 @@ def restore_backup(archive: Path, destination: Path, share_a_path: Path, share_b
                 raise BackupError(f"Size mismatch for: {relative}")
             if sha256_bytes(content) != expected_hash:
                 raise BackupError(f"SHA-256 mismatch for: {relative}")
+            verified_files.append(
+                {
+                    "path": relative,
+                    "size": len(content),
+                    "sha256": expected_hash,
+                    "status": "Passed",
+                }
+            )
             target = temp_destination.joinpath(*relative.split("/"))
             target.parent.mkdir(parents=True, exist_ok=True)
             atomic_write(target, content)
@@ -249,7 +291,11 @@ def restore_backup(archive: Path, destination: Path, share_a_path: Path, share_b
     else:
         shutil.rmtree(temp_destination, ignore_errors=True)
 
-    return {"destination": str(destination), "restored_file_count": restored}
+    return {
+        "destination": str(destination),
+        "restored_file_count": restored,
+        "verified_files": verified_files,
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -261,14 +307,10 @@ def build_parser() -> argparse.ArgumentParser:
     backup = subparsers.add_parser("backup", help="Create an encrypted backup")
     backup.add_argument("source", type=Path)
     backup.add_argument("archive", type=Path)
-    backup.add_argument("--custodian-a", type=Path, required=True)
-    backup.add_argument("--custodian-b", type=Path, required=True)
 
     restore = subparsers.add_parser("restore", help="Restore after both custodians release shares")
     restore.add_argument("archive", type=Path)
     restore.add_argument("destination", type=Path)
-    restore.add_argument("--custodian-a", type=Path, required=True)
-    restore.add_argument("--custodian-b", type=Path, required=True)
 
     subparsers.add_parser("test-key", help="Check that AES key splitting reconstructs correctly")
     return parser
@@ -278,11 +320,13 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = build_parser().parse_args(list(argv) if argv is not None else None)
     try:
         if args.command == "backup":
-            result = create_backup(args.source, args.archive, args.custodian_a, args.custodian_b)
-            print(json.dumps(result, indent=2))
+            raise BackupError(
+                "Standalone CLI backup is disabled; use SecureVault so custodian shares are protected."
+            )
         elif args.command == "restore":
-            result = restore_backup(args.archive, args.destination, args.custodian_a, args.custodian_b)
-            print(json.dumps(result, indent=2))
+            raise BackupError(
+                "Standalone CLI restore is disabled; both custodians must approve inside SecureVault."
+            )
         elif args.command == "test-key":
             key = AESGCM.generate_key(bit_length=256)
             a, b = split_key(key)

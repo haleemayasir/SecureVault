@@ -1,5 +1,5 @@
 cryptography>=43.0,<47.0
-customtkinter>=5.2,<6.0
+PySide6>=6.8,<7.0
 pillow>=10.0,<13.0
 
 # python -m venv .venv

@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.bin
+*.key
+encrypted_backups/
+restored_files/
+custodian1/
+custodian2/
+*-wal
+*-shm
